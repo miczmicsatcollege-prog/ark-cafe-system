@@ -94,3 +94,37 @@ jobs:
             const session = cookie.split(';')[0];
             const boot = await fetch(base + '/api/bootstrap', {headers: {Cookie: session}});
             assert.equal(boot.status, 200);
+            const data = await boot.json();
+            assert.equal(data.me.role, 'Admin');
+            assert.ok(data.menu.length > 0);
+            console.log('Health, frontend, logo, SQLite, admin login and menu checks passed.');
+          }
+          test().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE
+          then
+            cat "$RUNNER_TEMP/ark-cafe.log"
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy to Render (trigger)
+    needs: build-test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Trigger Render deployment for tested commit
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$RENDER_DEPLOY_HOOK" ]; then
+            echo 'Missing GitHub Actions secret: RENDER_DEPLOY_HOOK'
+            exit 1
+          fi
+          curl --fail --silent --show-error --max-time 60 \
+            --request POST --output /dev/null \
+            "${RENDER_DEPLOY_HOOK}&ref=${COMMIT_SHA}"
+          echo 'Render accepted the deployment request. Verify the live deployment in Render.'
