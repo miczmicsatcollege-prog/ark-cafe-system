@@ -1,0 +1,96 @@
+name: ARK Cafe CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ark-cafe-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Build - install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build - verify required files
+        run: |
+          test -s server.js
+          test -s menu-data.js
+          test -s schema.sql
+          test -s reset-password.js
+          test -s public/index.html
+          test -s public/logo.png
+
+      - name: Test - JavaScript syntax
+        run: |
+          node --check server.js
+          node --check menu-data.js
+          node --check reset-password.js
+
+      - name: Test - server, database and authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DATA_DIR="$(mktemp -d)"
+          export PORT=3000 HOST=127.0.0.1 DEMO=0 COOKIE_SECURE=0
+          export ADMIN_EMAIL=admin@arkcafe.ph ADMIN_PASSWORD=CI-Test-Only-2026
+          node server.js > "$RUNNER_TEMP/ark-cafe.log" 2>&1 &
+          pid=$!
+          cleanup() {
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            rm -rf "$DATA_DIR"
+          }
+          trap cleanup EXIT
+          for i in {1..30}; do
+            if curl -fsS --max-time 2 http://127.0.0.1:3000/health > /dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          if ! node <<'NODE'
+          const assert = require('node:assert/strict');
+          const base = 'http://127.0.0.1:3000';
+          async function test() {
+            const health = await fetch(base + '/health');
+            assert.equal(health.status, 200);
+            assert.equal((await health.json()).ok, true);
+            const page = await fetch(base + '/');
+            assert.equal(page.status, 200);
+            assert.match(page.headers.get('content-type'), /text\/html/);
+            assert.match(await page.text(), /ARK Cafe/i);
+            const logo = await fetch(base + '/logo.png');
+            assert.equal(logo.status, 200);
+            assert.match(logo.headers.get('content-type'), /image\/png/);
+            const login = await fetch(base + '/api/login', {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD})
+            });
+            assert.equal(login.status, 200);
+            assert.equal((await login.json()).ok, true);
+            const cookie = login.headers.get('set-cookie');
+            assert.ok(cookie);
+            const session = cookie.split(';')[0];
+            const boot = await fetch(base + '/api/bootstrap', {headers: {Cookie: session}});
+            assert.equal(boot.status, 200);
