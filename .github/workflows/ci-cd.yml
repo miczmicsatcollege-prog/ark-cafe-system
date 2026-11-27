@@ -1,3 +1,4 @@
+
 name: ARK Cafe CI/CD
 
 on:
@@ -6,6 +7,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy_to_render:
+        description: 'Deploy to Render after successful tests'
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,6 +26,36 @@ jobs:
     name: Build and Test
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    services:
+      postgres:
+        image: postgres:16
+
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: ci_test_password
+          POSTGRES_DB: arkcafe_test
+
+        ports:
+          - 5432:5432
+
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:ci_test_password@127.0.0.1:5432/arkcafe_test
+      PORT: 3000
+      HOST: 127.0.0.1
+      DEMO: '0'
+      COOKIE_SECURE: '0'
+      ADMIN_EMAIL: admin@arkcafe.ph
+      ADMIN_PASSWORD: CI-Test-Only-2026
+      EMPLOYEE_EMAIL: employee@arkcafe.test
+      EMPLOYEE_PASSWORD: CI-Employee-Test-2026
+
     steps:
       - name: Checkout source code
         uses: actions/checkout@v6
@@ -47,84 +84,374 @@ jobs:
           node --check menu-data.js
           node --check reset-password.js
 
-      - name: Test - server, database and authentication
+      - name: Test - PostgreSQL, authentication and data persistence
         shell: bash
         run: |
           set -euo pipefail
-          export DATA_DIR="$(mktemp -d)"
-          export PORT=3000 HOST=127.0.0.1 DEMO=0 COOKIE_SECURE=0
-          export ADMIN_EMAIL=admin@arkcafe.ph ADMIN_PASSWORD=CI-Test-Only-2026
-          node server.js > "$RUNNER_TEMP/ark-cafe.log" 2>&1 &
-          pid=$!
-          cleanup() {
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            rm -rf "$DATA_DIR"
-          }
-          trap cleanup EXIT
-          for i in {1..30}; do
-            if curl -fsS --max-time 2 http://127.0.0.1:3000/health > /dev/null 2>&1; then
-              break
-            fi
-            sleep 1
-          done
-          if ! node <<'NODE'
+
+          node <<'NODE'
           const assert = require('node:assert/strict');
+          const { spawn } = require('node:child_process');
+          const { once } = require('node:events');
+
           const base = 'http://127.0.0.1:3000';
-          async function test() {
-            const health = await fetch(base + '/health');
-            assert.equal(health.status, 200);
-            assert.equal((await health.json()).ok, true);
-            const page = await fetch(base + '/');
-            assert.equal(page.status, 200);
-            assert.match(page.headers.get('content-type'), /text\/html/);
-            assert.match(await page.text(), /ARK Cafe/i);
-            const logo = await fetch(base + '/logo.png');
-            assert.equal(logo.status, 200);
-            assert.match(logo.headers.get('content-type'), /image\/png/);
-            const login = await fetch(base + '/api/login', {
-              method: 'POST',
-              headers: {'Content-Type': 'application/json'},
-              body: JSON.stringify({email: process.env.ADMIN_EMAIL, password: process.env.ADMIN_PASSWORD})
+
+          let server;
+
+          const sleep = ms =>
+            new Promise(resolve => setTimeout(resolve, ms));
+
+          async function startServer() {
+            server = spawn(process.execPath, ['server.js'], {
+              env: process.env,
+              stdio: 'inherit'
             });
-            assert.equal(login.status, 200);
-            assert.equal((await login.json()).ok, true);
-            const cookie = login.headers.get('set-cookie');
-            assert.ok(cookie);
-            const session = cookie.split(';')[0];
-            const boot = await fetch(base + '/api/bootstrap', {headers: {Cookie: session}});
-            assert.equal(boot.status, 200);
-            const data = await boot.json();
-            assert.equal(data.me.role, 'Admin');
-            assert.ok(data.menu.length > 0);
-            console.log('Health, frontend, logo, SQLite, admin login and menu checks passed.');
+
+            for (let i = 0; i < 60; i++) {
+              if (server.exitCode !== null ||
+                  server.signalCode !== null) {
+                throw new Error('Server exited during startup.');
+              }
+
+              try {
+                const response = await fetch(base + '/health', {
+                  signal: AbortSignal.timeout(2000)
+                });
+
+                if (response.ok) {
+                  console.log('Server is ready.');
+                  return;
+                }
+              } catch {}
+
+              await sleep(1000);
+            }
+
+            throw new Error('Server startup timed out.');
           }
-          test().catch(error => { console.error(error); process.exitCode = 1; });
+
+          async function stopServer() {
+            if (!server ||
+                server.exitCode !== null ||
+                server.signalCode !== null) {
+              return;
+            }
+
+            const exited = once(server, 'exit');
+
+            server.kill('SIGTERM');
+
+            const timer = setTimeout(() => {
+              server.kill('SIGKILL');
+            }, 5000);
+
+            try {
+              await exited;
+            } finally {
+              clearTimeout(timer);
+            }
+          }
+
+          async function request(
+            endpoint,
+            method = 'GET',
+            body,
+            cookie
+          ) {
+            const headers = {};
+
+            if (body !== undefined) {
+              headers['Content-Type'] = 'application/json';
+            }
+
+            if (cookie) {
+              headers.Cookie = cookie;
+            }
+
+            const response = await fetch(base + endpoint, {
+              method,
+              headers,
+              body: body === undefined
+                ? undefined
+                : JSON.stringify(body),
+              signal: AbortSignal.timeout(10000)
+            });
+
+            assert.equal(
+              response.status,
+              200,
+              method + ' ' + endpoint +
+                ' returned ' + response.status
+            );
+
+            return response;
+          }
+
+          async function login(email, password) {
+            const response = await request(
+              '/api/login',
+              'POST',
+              { email, password }
+            );
+
+            const result = await response.json();
+
+            assert.equal(result.ok, true);
+
+            const cookie = response.headers.get('set-cookie');
+
+            assert.ok(cookie, 'Login cookie is missing.');
+
+            return cookie.split(';')[0];
+          }
+
+          async function bootstrap(cookie) {
+            const response = await request(
+              '/api/bootstrap',
+              'GET',
+              undefined,
+              cookie
+            );
+
+            return response.json();
+          }
+
+          async function test() {
+            try {
+              await startServer();
+
+              // Health endpoint
+              const health = await request('/health');
+
+              assert.equal((await health.json()).ok, true);
+
+              console.log('PASS: Health check');
+
+              // Frontend
+              const page = await request('/');
+
+              assert.match(
+                page.headers.get('content-type'),
+                /text\/html/
+              );
+
+              assert.match(await page.text(), /ARK Cafe/i);
+
+              console.log('PASS: Frontend');
+
+              // Logo
+              const logo = await request('/logo.png');
+
+              assert.match(
+                logo.headers.get('content-type'),
+                /image\/png/
+              );
+
+              console.log('PASS: Logo');
+
+              // Admin authentication
+              let admin = await login(
+                process.env.ADMIN_EMAIL,
+                process.env.ADMIN_PASSWORD
+              );
+
+              let data = await bootstrap(admin);
+
+              assert.equal(data.me.role, 'Admin');
+              assert.ok(data.menu.length > 0);
+
+              console.log('PASS: Admin login');
+              console.log('PASS: PostgreSQL menu data');
+
+              // Create employee
+              await request(
+                '/api/users',
+                'POST',
+                {
+                  name: 'CI Test Employee',
+                  email: process.env.EMPLOYEE_EMAIL,
+                  password: process.env.EMPLOYEE_PASSWORD,
+                  role: 'Employee'
+                },
+                admin
+              );
+
+              let employee = await login(
+                process.env.EMPLOYEE_EMAIL,
+                process.env.EMPLOYEE_PASSWORD
+              );
+
+              let employeeData = await bootstrap(employee);
+
+              assert.equal(employeeData.me.role, 'Employee');
+
+              console.log('PASS: Employee creation and login');
+
+              // Add expense
+              await request(
+                '/api/expenses',
+                'POST',
+                {
+                  item: 'CI Persistence Test Expense',
+                  amount: 150
+                },
+                employee
+              );
+
+              employeeData = await bootstrap(employee);
+
+              assert.ok(
+                employeeData.exp.some(
+                  item =>
+                    item.i === 'CI Persistence Test Expense' &&
+                    item.a === 150
+                )
+              );
+
+              console.log('PASS: Expense creation');
+
+              // Register customer
+              await request(
+                '/api/signup',
+                'POST',
+                {
+                  name: 'CI Test Customer',
+                  email: 'customer@arkcafe.test',
+                  password: 'CI-Customer-Test-2026'
+                }
+              );
+
+              const customer = await login(
+                'customer@arkcafe.test',
+                'CI-Customer-Test-2026'
+              );
+
+              const customerData = await bootstrap(customer);
+
+              assert.equal(customerData.me.role, 'Customer');
+
+              const product = customerData.menu[0];
+              const variant = Object.keys(product.p)[0];
+
+              // Create order
+              const orderResponse = await request(
+                '/api/orders',
+                'POST',
+                {
+                  pay: 'cash',
+                  items: [
+                    {
+                      id: product.id,
+                      t: variant,
+                      q: 1,
+                      ao: []
+                    }
+                  ]
+                },
+                customer
+              );
+
+              const order = await orderResponse.json();
+
+              assert.ok(order.id);
+
+              console.log('PASS: Customer registration');
+              console.log('PASS: Order creation');
+
+              // Restart server without resetting PostgreSQL
+              console.log('Restarting application...');
+
+              await stopServer();
+              await startServer();
+
+              // Verify credentials remain unchanged
+              admin = await login(
+                process.env.ADMIN_EMAIL,
+                process.env.ADMIN_PASSWORD
+              );
+
+              employee = await login(
+                process.env.EMPLOYEE_EMAIL,
+                process.env.EMPLOYEE_PASSWORD
+              );
+
+              data = await bootstrap(admin);
+              employeeData = await bootstrap(employee);
+
+              assert.equal(data.me.role, 'Admin');
+              assert.equal(employeeData.me.role, 'Employee');
+
+              assert.ok(
+                data.users.some(
+                  user =>
+                    user.email === process.env.EMPLOYEE_EMAIL
+                )
+              );
+
+              assert.ok(
+                data.orders.some(
+                  item => item.id === order.id
+                )
+              );
+
+              assert.ok(
+                employeeData.exp.some(
+                  item =>
+                    item.i === 'CI Persistence Test Expense' &&
+                    item.a === 150
+                )
+              );
+
+              console.log('PASS: Admin login after restart');
+              console.log('PASS: Employee login after restart');
+              console.log('PASS: User data persistence');
+              console.log('PASS: Order data persistence');
+              console.log('PASS: Expense data persistence');
+
+              console.log('ALL POSTGRESQL TESTS PASSED');
+
+            } finally {
+              await stopServer();
+            }
+          }
+
+          test().catch(error => {
+            console.error(error);
+            process.exitCode = 1;
+          });
           NODE
-          then
-            cat "$RUNNER_TEMP/ark-cafe.log"
-            exit 1
-          fi
 
   deploy:
     name: Deploy to Render (trigger)
     needs: build-test
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.deploy_to_render == true
+
     runs-on: ubuntu-latest
     timeout-minutes: 5
+
     steps:
       - name: Trigger Render deployment for tested commit
         env:
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
           COMMIT_SHA: ${{ github.sha }}
+
         shell: bash
+
         run: |
           set -euo pipefail
+
           if [ -z "$RENDER_DEPLOY_HOOK" ]; then
             echo 'Missing GitHub Actions secret: RENDER_DEPLOY_HOOK'
             exit 1
           fi
+
           curl --fail --silent --show-error --max-time 60 \
             --request POST --output /dev/null \
             "${RENDER_DEPLOY_HOOK}&ref=${COMMIT_SHA}"
-          echo 'Render accepted the deployment request. Verify the live deployment in Render.'
+
+          echo 'Render accepted the deployment request.'
+          echo 'Verify the live deployment in Render.'
