@@ -1,5 +1,13 @@
 ARK CAFE — CORRECTED SYSTEM (FIFTH REVISION)
 
+
+Admin Username: Admin@arkcafe.ph
+Admin Password: ArkCafe@2026!
+
+Employee Username: maria@arkcafe.ph (optional)
+Employee Password: mariasantos (optional)
+
+
 INSTALL ON EXISTING PROJECT
 1. Back up the project, including its data directory.
 2. If upgrading from Version 2 or 3, replace public/index.html only.
